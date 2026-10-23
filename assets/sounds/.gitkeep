@@ -1,0 +1,2 @@
+# Este arquivo garante que a pasta assets/sounds exista no repositório
+# Os arquivos de áudio (.mp3, .ogg, .wav) são ignorados pelo .gitignore

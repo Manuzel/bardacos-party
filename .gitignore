@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Cache de áudio temporário (gerado em runtime)
+assets/sounds/*.mp3
+assets/sounds/*.ogg
+assets/sounds/*.wav
+
+# Biblioteca JSON (estado local do usuário)
+assets/library.json
+
+# Logs
+*.log
