@@ -34,3 +34,8 @@ assets/library.json
 
 # Logs
 *.log
+
+# Catálogo SQLite e backup do JSON antigo (estado local do usuário)
+assets/library.db
+assets/library.db-*
+assets/library.json.bak

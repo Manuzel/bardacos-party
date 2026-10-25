@@ -6,12 +6,11 @@ from typing import Callable, Optional, Dict, Any, List
 
 import yt_dlp
 
-from providers.base import BaseAudioProvider
 
-
-class YouTubeProvider(BaseAudioProvider):
+class YouTubeProvider:
     """
     Provedor de áudio do YouTube baseado no yt-dlp.
+    Implementa os ports `StreamResolver` e `TrackDownloader` (domain/ports.py).
     Suporta:
     1. Extração direta de URL de stream (sem gravação em disco para o VLC).
     2. Download persistente ou temporário (cache) para MP3.
@@ -119,17 +118,6 @@ class YouTubeProvider(BaseAudioProvider):
             daemon=True
         )
         worker_thread.start()
-
-    def download_or_stream(
-        self,
-        query_or_url: str,
-        output_dir: str,
-        on_progress: Optional[Callable[[float, str], None]] = None,
-        on_complete: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        on_error: Optional[Callable[[Exception], None]] = None
-    ) -> None:
-        """Compatibilidade com a interface BaseAudioProvider."""
-        self.download(query_or_url, output_dir, on_progress, on_complete, on_error)
 
     def _download_worker(
         self,

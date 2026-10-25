@@ -1,23 +1,20 @@
 import os
 import tempfile
-import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 import customtkinter as ctk
 
+from application.library import LibraryService
 from audio.engine import AudioEngine
-from providers.youtube import YouTubeProvider
-from library_manager import LibraryManager
+from domain.models import SourceKind
+from domain.ports import StreamResolver, TrackDownloader
 from ui.components import SoundCard
-
-ALLOWED_EXTENSIONS = {".mp3", ".ogg", ".wav"}
 
 
 class MainWindow(ctk.CTk):
     """
     Janela Principal do Bardaco's Party com:
-    - Camada de Persistência JSON integrada (LibraryManager)
-    - Mesclagem automática (Merge) entre faixas físicas locais e virtuais (Streaming/Cache)
+    - Catálogo único (LibraryService) para faixas locais, de streaming e de cache
     - Resolução On-Demand de streams salvos
     - Exclusão dinâmica com remoção física de arquivo ou descarte de registro
     """
@@ -25,18 +22,18 @@ class MainWindow(ctk.CTk):
     def __init__(
         self,
         audio_engine: AudioEngine,
-        audio_provider: YouTubeProvider,
+        library: LibraryService,
+        stream_resolver: StreamResolver,
+        downloader: TrackDownloader,
         sounds_dir: str
     ):
         super().__init__()
 
         self.audio_engine = audio_engine
-        self.audio_provider = audio_provider
+        self.library = library
+        self.stream_resolver = stream_resolver
+        self.downloader = downloader
         self.sounds_dir = Path(sounds_dir).resolve()
-
-        # Inicializa o Gerenciador de Biblioteca em assets/library.json
-        library_json_path = self.sounds_dir.parent / "library.json"
-        self.library_manager = LibraryManager(library_json_path)
 
         # Pasta temporária para o modo 'Tocar em Cache'
         self.temp_cache_dir = tempfile.TemporaryDirectory(prefix="bardaco_cache_")
@@ -203,7 +200,7 @@ class MainWindow(ctk.CTk):
 
         if mode == "Streaming Direto":
             self._show_status("Extraindo fluxo direto de áudio (Nuvem)...", is_error=False)
-            self.audio_provider.get_stream_url(
+            self.stream_resolver.get_stream_url(
                 query_or_url=query,
                 on_success=lambda url, meta: self.after(0, self._on_stream_ready, url, meta, query),
                 on_error=lambda exc: self.after(0, self._on_operation_error, exc)
@@ -211,7 +208,7 @@ class MainWindow(ctk.CTk):
 
         elif mode == "Tocar em Cache":
             self._show_status("Baixando faixa para cache temporário...", is_error=False)
-            self.audio_provider.download(
+            self.downloader.download(
                 query_or_url=query,
                 output_dir=self.temp_cache_dir.name,
                 on_progress=lambda pct, msg: self.after(0, self._on_progress, pct, msg),
@@ -221,7 +218,7 @@ class MainWindow(ctk.CTk):
 
         elif mode == "Salvar na Biblioteca":
             self._show_status("Baixando para a biblioteca permanente...", is_error=False)
-            self.audio_provider.download(
+            self.downloader.download(
                 query_or_url=query,
                 output_dir=str(self.sounds_dir),
                 on_progress=lambda pct, msg: self.after(0, self._on_progress, pct, msg),
@@ -234,20 +231,16 @@ class MainWindow(ctk.CTk):
         self._show_status(msg, is_error=False)
 
     def _on_stream_ready(self, stream_url: str, meta: dict, original_query: str) -> None:
-        """Salva a faixa de streaming no JSON e adiciona ao Grid."""
+        """Registra a faixa de streaming no catálogo e adiciona ao Grid."""
         title = meta.get("title", "Streaming YouTube")
         duration = float(meta.get("duration", 0.0))
         target_url = meta.get("webpage_url") or original_query
-        sound_id = f"stream_{uuid.uuid4().hex[:8]}"
-
-        # Persistência no library.json
-        self.library_manager.add_track(
-            sound_id=sound_id,
+        sound_id = self.library.add_remote_track(
             title=title,
-            url=target_url,
-            mode="stream",
-            duration=duration
-        )
+            origin_url=target_url,
+            source_kind=SourceKind.STREAM,
+            duration_s=duration
+        ).id
 
         self._show_status(f"Streaming registrado: '{title}'", is_error=False)
         self._finish_action()
@@ -268,20 +261,16 @@ class MainWindow(ctk.CTk):
         self._add_card_to_grid(sound_id, card, auto_play=True)
 
     def _on_cache_ready(self, file_path: str, meta: dict, original_query: str) -> None:
-        """Salva a faixa de cache no JSON e adiciona ao Grid."""
+        """Registra a faixa de cache no catálogo e adiciona ao Grid."""
         title = meta.get("title", Path(file_path).stem)
         duration = float(meta.get("duration", 0.0))
         target_url = meta.get("webpage_url") or original_query
-        sound_id = f"cache_{uuid.uuid4().hex[:8]}"
-
-        # Persistência no library.json
-        self.library_manager.add_track(
-            sound_id=sound_id,
+        sound_id = self.library.add_remote_track(
             title=title,
-            url=target_url,
-            mode="cache",
-            duration=duration
-        )
+            origin_url=target_url,
+            source_kind=SourceKind.CACHE,
+            duration_s=duration
+        ).id
 
         self._show_status(f"Faixa em cache registrada: '{title}'", is_error=False)
         self._finish_action()
@@ -309,7 +298,7 @@ class MainWindow(ctk.CTk):
 
     def _save_card_to_permanent_library(self, sound_id: str, original_url: str) -> None:
         self._show_status("Baixando cópia permanente para assets/sounds em segundo plano...", is_error=False)
-        self.audio_provider.download(
+        self.downloader.download(
             query_or_url=original_url,
             output_dir=str(self.sounds_dir),
             on_complete=lambda path, meta: self.after(0, self._on_background_save_complete, meta),
@@ -350,13 +339,13 @@ class MainWindow(ctk.CTk):
     ) -> None:
         """Resolve a URL de streaming expirada ou baixa novamente para a pasta de cache."""
         if mode_type == "stream":
-            self.audio_provider.get_stream_url(
+            self.stream_resolver.get_stream_url(
                 query_or_url=target_url,
                 on_success=lambda url, meta: self.after(0, on_ready, url),
                 on_error=lambda exc: self.after(0, on_error, exc)
             )
         elif mode_type == "cache":
-            self.audio_provider.download(
+            self.downloader.download(
                 query_or_url=target_url,
                 output_dir=self.temp_cache_dir.name,
                 on_complete=lambda path, meta: self.after(0, on_ready, path),
@@ -367,62 +356,42 @@ class MainWindow(ctk.CTk):
 
     def load_sound_cards(self) -> None:
         """
-        Executa a mesclagem (Merge):
-        1. Varre arquivos físicos em assets/sounds.
-        2. Lê as faixas virtuais salvas em assets/library.json.
-        3. Renderiza os cards unificados preservando faixas em execução.
+        Reconcilia a pasta assets/sounds com o catálogo e recria os cards de todas
+        as faixas disponíveis (locais, streaming e cache), em ordem alfabética.
         """
-        # Destrói apenas os cards que não estão tocando ou limpa o grid
         for card in list(self.cards_dict.values()):
             card.destroy()
         self.cards_dict.clear()
 
-        # 1. Carrega Faixas Físicas Locais
-        if not self.sounds_dir.exists():
-            self.sounds_dir.mkdir(parents=True, exist_ok=True)
+        self.library.refresh_local_files()
 
-        local_files: List[Path] = []
-        for ext in ALLOWED_EXTENSIONS:
-            local_files.extend(self.sounds_dir.rglob(f"*{ext}"))
-        local_files.sort(key=lambda p: p.name.lower())
-
-        for sound_path in local_files:
-            clean_title = sound_path.stem.replace("_", " ").replace("-", " ").title()
-            sound_id = f"local_{sound_path.name}"
-
-            card = SoundCard(
-                master=self.scroll_frame,
-                sound_id=sound_id,
-                title=clean_title,
-                source=str(sound_path),
-                audio_engine=self.audio_engine,
-                mode_type="local",
-                on_delete=self._delete_sound_card
-            )
-            self.cards_dict[sound_id] = card
-
-        # 2. Carrega Faixas Virtuais do library.json
-        saved_virtual_tracks = self.library_manager.get_all_tracks()
-        for track in saved_virtual_tracks:
-            s_id = track["sound_id"]
-            # Evita colisões se o ID já existir
-            if s_id in self.cards_dict:
-                continue
-
-            card = SoundCard(
-                master=self.scroll_frame,
-                sound_id=s_id,
-                title=track.get("title", "Áudio Virtual"),
-                source="",  # Será resolvido On-Demand no primeiro Play
-                audio_engine=self.audio_engine,
-                mode_type=track.get("mode", "stream"),
-                duration=float(track.get("duration", 0.0)),
-                original_url=track.get("url"),
-                on_save_to_library=self._save_card_to_permanent_library,
-                on_delete=self._delete_sound_card,
-                on_resolve_source=self._resolve_virtual_track
-            )
-            self.cards_dict[s_id] = card
+        for track in self.library.tracks():
+            if track.source_kind == SourceKind.LOCAL:
+                card = SoundCard(
+                    master=self.scroll_frame,
+                    sound_id=track.id,
+                    title=track.title,
+                    source=str(self.library.local_file_of(track)),
+                    audio_engine=self.audio_engine,
+                    mode_type=track.source_kind.value,
+                    duration=track.duration_s or 0.0,
+                    on_delete=self._delete_sound_card
+                )
+            else:
+                card = SoundCard(
+                    master=self.scroll_frame,
+                    sound_id=track.id,
+                    title=track.title,
+                    source="",  # Será resolvido On-Demand no primeiro Play
+                    audio_engine=self.audio_engine,
+                    mode_type=track.source_kind.value,
+                    duration=track.duration_s or 0.0,
+                    original_url=track.origin_url,
+                    on_save_to_library=self._save_card_to_permanent_library,
+                    on_delete=self._delete_sound_card,
+                    on_resolve_source=self._resolve_virtual_track
+                )
+            self.cards_dict[track.id] = card
 
         self._reposition_cards()
 
@@ -430,8 +399,8 @@ class MainWindow(ctk.CTk):
         """
         Exclui uma faixa:
         - Se for arquivo físico local: remove o arquivo do disco.
-        - Se for faixa virtual: remove a entrada de assets/library.json.
-        - Remove o card da interface dinamicamente.
+        - Se for faixa virtual: descarta o arquivo temporário, se houver.
+        - Em todos os casos, remove a faixa do catálogo e o card da interface.
         """
         card = self.cards_dict.get(sound_id)
         if not card:
@@ -450,15 +419,14 @@ class MainWindow(ctk.CTk):
                 self._show_status(f"Erro ao excluir arquivo físico: {e}", is_error=True)
                 return
 
-        # 2. Exclusão de metadados no JSON para faixas virtuais
-        elif card.mode_type in ("stream", "cache"):
-            self.library_manager.remove_track(sound_id)
-            # Remove arquivo temporário se houver
-            if card.mode_type == "cache" and card.source and os.path.exists(card.source):
-                try:
-                    os.remove(card.source)
-                except OSError:
-                    pass
+        # 2. Remove arquivo temporário de faixas em cache, se houver
+        elif card.mode_type == "cache" and card.source and os.path.exists(card.source):
+            try:
+                os.remove(card.source)
+            except OSError:
+                pass
+
+        self.library.remove_track(sound_id)
 
         # 3. Remoção do componente da interface
         card.destroy()
