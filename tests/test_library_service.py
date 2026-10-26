@@ -152,6 +152,60 @@ class LibraryServiceTest(unittest.TestCase):
         self.assertFalse(track.missing)
         self.assertEqual(track.duration_s, 2.0)
 
+    def test_tags_padrao_e_categorias_em_ordem(self):
+        self.assertEqual(self.library.tag_categories(), ["Cenário", "Uso", "Timbre", "Lugar", "Clima"])
+        self.library.create_tag("Bardo", None)
+        self.assertEqual(self.library.tag_categories()[-1], "Outras")
+
+    def test_criar_tag_no_fim_da_categoria_e_recusar_repetida(self):
+        tag = self.library.create_tag("  Tambores ", "Timbre")
+        self.assertEqual((tag.name, tag.category), ("Tambores", "Timbre"))
+        timbre = [t.name for t in self.library.tags() if t.category == "Timbre"]
+        self.assertEqual(timbre[-1], "Tambores")
+        with self.assertRaises(ValueError):
+            self.library.create_tag("CORAL", "Timbre")
+
+    def test_marcar_tags_e_formato_grava_e_reindexa(self):
+        from application.library_index import LibraryQuery
+        self.folder.files = ["grito.wav"]
+        self.library.refresh_local_files()
+        (track,) = self.library.tracks()
+        masmorra = next(t.id for t in self.library.tags() if t.name == "Masmorra")
+
+        self.library.toggle_track_tag(track.id, masmorra)
+        self.library.set_track_kind(track.id, TrackKind.SFX)
+
+        reloaded = LibraryService(self.repo, self.folder)
+        self.assertEqual(reloaded.get(track.id).tag_ids, frozenset({masmorra}))
+        self.assertEqual(reloaded.get(track.id).kind, TrackKind.SFX)
+        self.assertEqual(len(self.library.query(LibraryQuery(include_tags=frozenset({masmorra})))), 1)
+        self.library.toggle_track_tag(track.id, masmorra)
+        self.assertEqual(self.library.query(LibraryQuery(include_tags=frozenset({masmorra}))), [])
+        with self.assertRaises(KeyError):
+            self.library.set_track_tags(track.id, frozenset({99999}))
+
+    def test_faixa_ausente_sai_da_busca_e_volta(self):
+        from application.library_index import LibraryQuery
+        self.folder.files = ["grito.wav"]
+        self.library.refresh_local_files()
+        self.folder.files = []
+        self.library.refresh_local_files()
+        self.assertEqual(self.library.query(LibraryQuery()), [])
+        self.folder.files = ["grito.wav"]
+        self.library.refresh_local_files()
+        self.assertEqual(len(self.library.query(LibraryQuery())), 1)
+
+    def test_link_origin_liga_o_arquivo_baixado_ao_youtube(self):
+        self.folder.files = ["Batalha Épica.mp3"]
+        self.library.refresh_local_files()
+        url = "https://www.youtube.com/watch?v=oVZ8KGtZtwY"
+
+        track = self.library.link_origin(Path("/sons/Batalha Épica.mp3"), url)
+
+        self.assertEqual(track.origin_url, url)
+        self.assertEqual(track.source_kind, SourceKind.LOCAL)
+        self.assertIsNone(self.library.link_origin(Path("/sons/outro.mp3"), url))
+
     def test_falha_ao_gravar_nao_altera_a_memoria(self):
         repo = FailingCommitRepository(":memory:")
         library = LibraryService(repo, FakeSoundFolder("chuva.ogg"))

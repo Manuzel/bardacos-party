@@ -10,6 +10,9 @@ Um Soundpad multi-track para mestres de RPG de mesa, com suporte a reprodução 
   - ☁️ **Streaming Direto** — Reproduz áudio do YouTube via VLC sem baixar nada.
   - ⚡ **Tocar em Cache** — Baixa para pasta temporária, descartada ao fechar o app.
   - 💾 **Salvar na Biblioteca** — Download permanente em `assets/sounds/`.
+- **Biblioteca por tags:** filtros na lateral por Origem, Formato e cinco categorias de tags (Cenário, Uso, Timbre, Lugar, Clima), com contagem ao vivo. Clique inclui (verde), botão direito exclui (vermelho riscado). Busca sem acento no título e nas tags, e ordenação por título, recentes ou duração.
+- **Cards com capa:** miniatura do YouTube ou capa embutida no arquivo, duração, tags (as filtradas em verde) e "+N" quando não cabem. Marque tags e o formato pelo menu ⋯ (ou botão direito no card).
+- **Deck:** as faixas tocando ficam numa barra embaixo, com tempo, seek, volume e loop.
 - **Linha do Tempo Interativa (Seekbar)** com seek preciso via libVLC.
 - **Catálogo em SQLite** — Faixas locais, de streaming e de cache ficam em `assets/library.db`, com gravação atômica. O `library.json` antigo é importado sozinho na primeira execução e guardado como `library.json.bak`.
 - **Download do YouTube** via `yt-dlp` em threads separadas (nunca congela a UI).
@@ -54,6 +57,7 @@ bardacos_party/
 │   └── ports.py            # Contratos: repositório, pasta de sons, backends de áudio, mídia
 ├── application/
 │   ├── library.py          # LibraryService: casos de uso do catálogo (write-through)
+│   ├── library_index.py    # Índice em memória: tags, formato, origem, texto, ordenação
 │   └── audio/
 │       ├── messages.py     # Comandos, eventos e snapshot trocados com a UI
 │       ├── selector.py     # Regra de qual player toca cada faixa
@@ -61,6 +65,7 @@ bardacos_party/
 │       └── orchestrator.py # Thread "audio-ctl" com fila em volta do mixer
 ├── infrastructure/
 │   ├── sound_folder.py     # Pasta assets/sounds
+│   ├── covers.py           # Capas em assets/covers (YouTube ou capa embutida)
 │   ├── backends/
 │   │   ├── vlc_backend.py  # Adapter libVLC (uma instância) + sonda de duração
 │   │   └── pygame_backend.py # Adapter pygame.mixer (pool de canais, cache LRU)
@@ -70,9 +75,16 @@ bardacos_party/
 ├── providers/
 │   └── youtube.py          # yt-dlp com threads (implementa os ports de mídia)
 ├── tests/
-├── ui/
-│   ├── main_window.py      # Janela principal com seletor de modos
-│   ├── components.py       # SoundCard: envia comandos e desenha o snapshot
+├── presentation/
+│   ├── main_window.py      # Compõe as views e liga as ações aos serviços
+│   ├── library_vm.py       # ViewModel da biblioteca (filtros, contagens), sem Tk
+│   ├── sidebar.py          # Lateral de filtros por categoria
+│   ├── chips.py            # Chips desenhados num canvas com quebra de linha
+│   ├── grid.py             # Grade virtual de cards num único canvas
+│   ├── cover_images.py     # Capas no tamanho do card (e capa gerada)
+│   ├── deck.py             # O que está tocando, com tempo/volume/loop
+│   ├── canvas_draw.py      # Layout puro (título, chips, "+N") e cantos arredondados
+│   ├── theme.py            # Cores e fontes
 │   └── pump.py             # Único laço de atualização da UI (after 33 ms)
 └── assets/
     └── sounds/             # Biblioteca local de áudios

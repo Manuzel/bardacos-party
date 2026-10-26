@@ -5,7 +5,8 @@ alterações geram uma cópia nova com `dataclasses.replace`.
 """
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 
 TrackId = str
@@ -46,6 +47,9 @@ class Track:
     backend_hint: BackendHint | None = None
     missing: bool = False            # Arquivo local sumiu do disco; a faixa fica guardada, não apagada
     tag_ids: frozenset[TagId] = frozenset()
+    # Quando entrou no catálogo (ordenação "recentes"). Fica fora da igualdade: o banco
+    # guarda com precisão de segundos.
+    added_at: datetime | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if not self.title.strip():
@@ -65,7 +69,8 @@ class Tag:
     id: TagId | None  # None até ser gravada pela primeira vez
     name: str
     color: str | None = None
-    position: int = 0  # Ordem dos chips na UI
+    position: int = 0            # Ordem dos chips na UI; a ordem das categorias segue a menor posição
+    category: str | None = None  # Grupo na lateral (Cenário, Uso, Timbre, Lugar, Clima)
 
     def __post_init__(self) -> None:
         if not self.name.strip():

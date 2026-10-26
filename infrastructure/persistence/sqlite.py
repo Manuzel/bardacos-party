@@ -56,6 +56,34 @@ MIGRATIONS: tuple[str, ...] = (
     """,
 )
 
+# Tags iniciais da migração 2. Fazem parte de uma migração publicada: não edite esta
+# lista; tags padrão novas entram numa migração nova.
+DEFAULT_TAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Cenário", ("Fantasia", "Medieval", "Horror", "Ficção Científica", "Cyberpunk",
+                 "Steampunk", "Moderno", "Faroeste")),
+    ("Uso", ("Combate", "Suspense", "Exploração", "Descanso", "Chefe", "Tema")),
+    ("Timbre", ("Acústico", "Orquestral", "Coral", "Eletrônico", "Híbrido", "Percussivo")),
+    ("Lugar", ("Taverna", "Cidade", "Estrada", "Floresta", "Selva", "Pântano", "Montanha",
+               "Deserto", "Ártico", "Mar", "Submerso", "Masmorra", "Caverna", "Ruínas",
+               "Templo", "Castelo", "Planar", "Espaço", "Acampamento")),
+    ("Clima", ("Épico", "Heroico", "Tenso", "Sombrio", "Sinistro", "Misterioso", "Místico",
+               "Sagrado", "Melancólico", "Pacífico", "Alegre", "Festivo", "Brutal")),
+)
+
+
+def _default_tags_sql() -> str:
+    rows = []
+    for category, names in DEFAULT_TAGS:
+        for name in names:
+            rows.append(f"('{name}', '{category}', {len(rows)})")
+    return "INSERT OR IGNORE INTO tags (name, category, position) VALUES\n" + ",\n".join(rows) + ";"
+
+
+MIGRATIONS += (
+    # 2 — Categoria das tags (grupos da lateral) e tags padrão
+    "ALTER TABLE tags ADD COLUMN category TEXT;\n" + _default_tags_sql(),
+)
+
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -99,7 +127,8 @@ class SqliteLibraryRepository:
 
     def load(self) -> LibraryData:
         tags = tuple(
-            Tag(id=row["id"], name=row["name"], color=row["color"], position=row["position"])
+            Tag(id=row["id"], name=row["name"], color=row["color"], position=row["position"],
+                category=row["category"])
             for row in self._conn.execute("SELECT * FROM tags ORDER BY position, name")
         )
 
@@ -146,7 +175,7 @@ class SqliteUnitOfWork:
                 default_volume, default_loop, backend_hint, missing, created_at, updated_at
             ) VALUES (
                 :id, :title, :title_norm, :kind, :source_kind, :local_path, :origin_url, :duration_s,
-                :default_volume, :default_loop, :backend_hint, :missing, :now, :now
+                :default_volume, :default_loop, :backend_hint, :missing, :created_at, :now
             )
             ON CONFLICT (id) DO UPDATE SET
                 title = excluded.title,
@@ -175,6 +204,7 @@ class SqliteUnitOfWork:
                 "default_loop": int(track.default_loop),
                 "backend_hint": track.backend_hint.value if track.backend_hint else None,
                 "missing": int(track.missing),
+                "created_at": _iso(track.added_at) if track.added_at else now,  # Só vale na inserção
                 "now": now,
             },
         )
@@ -188,17 +218,20 @@ class SqliteUnitOfWork:
         self._conn.execute("DELETE FROM tracks WHERE id = ?", (track_id,))
 
     def save_tag(self, tag: Tag) -> Tag:
-        params = {"id": tag.id, "name": tag.name.strip(), "color": tag.color, "position": tag.position}
+        params = {"id": tag.id, "name": tag.name.strip(), "color": tag.color,
+                  "position": tag.position, "category": tag.category}
         try:
             if tag.id is None:
                 cursor = self._conn.execute(
-                    "INSERT INTO tags (name, color, position) VALUES (:name, :color, :position)",
+                    "INSERT INTO tags (name, color, position, category) "
+                    "VALUES (:name, :color, :position, :category)",
                     params,
                 )
                 return replace(tag, id=cursor.lastrowid, name=params["name"])
 
             cursor = self._conn.execute(
-                "UPDATE tags SET name = :name, color = :color, position = :position WHERE id = :id",
+                "UPDATE tags SET name = :name, color = :color, position = :position, "
+                "category = :category WHERE id = :id",
                 params,
             )
         except sqlite3.IntegrityError as exc:
@@ -226,8 +259,13 @@ def _row_to_track(row: sqlite3.Row, tag_ids: frozenset[TagId]) -> Track:
         backend_hint=BackendHint(row["backend_hint"]) if row["backend_hint"] else None,
         missing=bool(row["missing"]),
         tag_ids=tag_ids,
+        added_at=datetime.fromisoformat(row["created_at"]),
     )
 
 
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return _iso(datetime.now(timezone.utc))
