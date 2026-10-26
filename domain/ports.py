@@ -56,6 +56,20 @@ class MediaProbe(Protocol):
         ...
 
 
+class CoverProvider(Protocol):
+    """Capas das faixas, guardadas em disco e buscadas em segundo plano."""
+
+    def cover_path(self, track_id: TrackId) -> Path | None:
+        """Arquivo da capa, se já existir."""
+        ...
+
+    def request(self, track: Track, local_file: Path | None, on_ready: Callable[[TrackId], None]) -> None:
+        """Busca a capa se faltar. `on_ready` é chamado de outra thread quando ela fica pronta."""
+        ...
+
+    def discard(self, track_id: TrackId) -> None: ...
+
+
 # ---------------- Reprodução ----------------
 # Só a thread do orquestrador chama VoiceHandle e PlaybackBackend.
 

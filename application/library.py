@@ -4,12 +4,18 @@ Write-through: cada operação grava no repositório e, só se a transação con
 atualiza o estado em memória. O disco é a fonte da verdade; a memória é o índice.
 """
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from application.library_index import FacetCounts, LibraryIndex, LibraryQuery
 from domain.models import (
-    SourceKind, Track, TrackId, infer_kind, new_track_id, normalize_title, title_from_filename
+    SourceKind, Tag, TagId, Track, TrackId, TrackKind, infer_kind, new_track_id, normalize_title,
+    title_from_filename,
 )
 from domain.ports import LibraryRepository, MediaProbe, SoundFolder
+
+# Grupo das tags sem categoria na lateral
+UNCATEGORIZED = "Outras"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +36,15 @@ class LibraryService:
         self._repository = repository
         self._sound_folder = sound_folder
         self._probe = probe
-        self._tracks: dict[TrackId, Track] = {t.id: t for t in repository.load().tracks}
+        data = repository.load()
+        self._tracks: dict[TrackId, Track] = {t.id: t for t in data.tracks}
+        self._tags: dict[TagId, Tag] = {t.id: t for t in data.tags}
+        self._index = LibraryIndex(data.tags)
+        for track in data.tracks:
+            if not track.missing:
+                self._index.upsert(track)
+
+    # ---------------- Consultas ----------------
 
     def tracks(self, include_missing: bool = False) -> list[Track]:
         """Faixas em ordem alfabética (sem acentos e sem caixa)."""
@@ -39,6 +53,26 @@ class LibraryService:
 
     def get(self, track_id: TrackId) -> Track | None:
         return self._tracks.get(track_id)
+
+    def query(self, query: LibraryQuery) -> list[Track]:
+        """Faixas visíveis (não ausentes) que atendem ao filtro, já ordenadas."""
+        return self._index.query(query)
+
+    def facet_counts(self, tracks: list[Track]) -> FacetCounts:
+        return self._index.facet_counts(tracks)
+
+    def tags(self) -> list[Tag]:
+        return sorted(self._tags.values(), key=lambda t: (t.position, normalize_title(t.name)))
+
+    def tag(self, tag_id: TagId) -> Tag | None:
+        return self._tags.get(tag_id)
+
+    def tag_categories(self) -> list[str]:
+        """Categorias na ordem da lateral: pela menor posição das suas tags; "Outras" no fim."""
+        first_position: dict[str, int] = {}
+        for tag in self.tags():
+            first_position.setdefault(tag.category or UNCATEGORIZED, tag.position)
+        return sorted(first_position, key=lambda c: (c == UNCATEGORIZED, first_position[c]))
 
     def local_file_of(self, track: Track) -> Path:
         if track.local_path is None:
@@ -61,9 +95,52 @@ class LibraryService:
             source_kind=source_kind,
             origin_url=origin_url,
             duration_s=duration,
+            added_at=_now(),
         )
         self._save(track)
         return track
+
+    def link_origin(self, local_file: Path, origin_url: str) -> Track | None:
+        """Liga um arquivo baixado à página de origem (assim ele ganha capa e pode ser baixado de novo)."""
+        target = local_file.resolve()
+        for track in self._tracks.values():
+            if track.local_path and self.local_file_of(track).resolve() == target:
+                if track.origin_url == origin_url:
+                    return track
+                updated = replace(track, origin_url=origin_url)
+                self._save(updated)
+                return updated
+        return None
+
+    # ---------------- Tags e formato ----------------
+
+    def create_tag(self, name: str, category: str | None) -> Tag:
+        """Cria a tag no fim da categoria. Nome repetido (ignorando caixa) -> ValueError."""
+        category = None if category in (None, UNCATEGORIZED) else category
+        last = max((t.position for t in self._tags.values()), default=-1)
+        with self._repository.unit_of_work() as uow:
+            tag = uow.save_tag(Tag(id=None, name=name.strip(), category=category, position=last + 1))
+        self._tags[tag.id] = tag
+        self._index.set_tags(self._tags.values())
+        return tag
+
+    def set_track_tags(self, track_id: TrackId, tag_ids: frozenset[TagId]) -> Track:
+        track = self._require(track_id)
+        unknown = tag_ids - self._tags.keys()
+        if unknown:
+            raise KeyError(f"Tags inexistentes: {sorted(unknown)}")
+        updated = replace(track, tag_ids=frozenset(tag_ids))
+        self._save(updated)
+        return updated
+
+    def toggle_track_tag(self, track_id: TrackId, tag_id: TagId) -> Track:
+        track = self._require(track_id)
+        return self.set_track_tags(track_id, track.tag_ids ^ {tag_id})
+
+    def set_track_kind(self, track_id: TrackId, kind: TrackKind) -> Track:
+        updated = replace(self._require(track_id), kind=kind)
+        self._save(updated)
+        return updated
 
     def remove_track(self, track_id: TrackId) -> Track | None:
         track = self._tracks.get(track_id)
@@ -72,6 +149,7 @@ class LibraryService:
         with self._repository.unit_of_work() as uow:
             uow.delete_track(track_id)
         del self._tracks[track_id]
+        self._index.remove(track_id)
         return track
 
     def refresh_local_files(self) -> SyncReport:
@@ -95,6 +173,7 @@ class LibraryService:
                 source_kind=SourceKind.LOCAL,
                 local_path=path,
                 duration_s=duration,
+                added_at=_now(),
             ))
 
         changed: list[Track] = []
@@ -129,3 +208,17 @@ class LibraryService:
                 uow.save_track(track)
         for track in tracks:
             self._tracks[track.id] = track
+            if track.missing:
+                self._index.remove(track.id)
+            else:
+                self._index.upsert(track)
+
+    def _require(self, track_id: TrackId) -> Track:
+        track = self._tracks.get(track_id)
+        if track is None:
+            raise KeyError(f"Faixa {track_id} não existe.")
+        return track
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)

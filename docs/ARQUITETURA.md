@@ -1,6 +1,6 @@
 # Bardaco's Party — Documento de Design Arquitetural (HLD)
 
-> Status: **aprovado** · Implementados: módulo 1 (fundação) e módulo 2 (orquestrador) · Base avaliada: commit `6ccb7b6` · Python 3.14 (GIL padrão)
+> Status: **aprovado** · Implementados: módulos 1 (fundação), 2 (orquestrador) e 4 (tags e biblioteca visual) · Base avaliada: commit `6ccb7b6` · Python 3.14 (GIL padrão)
 
 Escopo: (1) Tags e indexação, (2) Cenas e orquestração, (3) Fade In/Out assíncrono.
 Este documento não contém código final; os trechos são contratos e pseudocódigo.
@@ -38,7 +38,7 @@ Conclusão: antes de tags/cenas/fades, é preciso uma fundação — **um dono �
 
 Os pacotes ficam na raiz do repositório (sem um pacote `bardacos/` envolvendo), seguindo o
 estilo de import que o projeto já usa. O antigo `audio/` virou `infrastructure/backends/` no
-módulo 2, e `ui/` vira `presentation/` no módulo 4.
+módulo 2, e `ui/` virou `presentation/` no módulo 4.
 
 Ajustes feitos no módulo 2, em relação ao plano:
 - O orquestrador se divide em `Mixer` (lógica pura, testada sem threads) e `AudioOrchestrator`
@@ -490,6 +490,15 @@ threads podem mexer na mesma voz, e o número de threads cresce sem controle.
 - Os ViewModels são testados sem janela; a View fica fina.
 
 ---
+
+Ajustes feitos no módulo 4 (feito antes do 3, a pedido, junto com o visual novo):
+- Tags ganharam categoria (migração 2, com um conjunto padrão em português). Origem e
+  Formato aparecem na lateral como grupos de filtro com semântica OU; tags usam E.
+- As contagens de Origem e Formato ignoram o próprio grupo, para dar para marcar mais de um.
+- Capas: miniatura do YouTube derivada do id do vídeo (sem chamar o yt-dlp) ou capa
+  embutida no arquivo, lida pelo libVLC; guardadas em `assets/covers`.
+- A grade é um único canvas virtual; o Deck usa widgets comuns (são poucas linhas).
+- A barra de seleção para criar cenas fica para o módulo 5, junto das cenas.
 
 ## 6. Ordem de implementação sugerida
 

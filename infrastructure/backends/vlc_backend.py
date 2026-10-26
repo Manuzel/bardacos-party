@@ -1,9 +1,12 @@
 """
-Adapter do libVLC (python-vlc) para os ports `PlaybackBackend` e `MediaProbe`.
+Adapter do libVLC (python-vlc) para os ports `PlaybackBackend` e `MediaProbe`
+(e a leitura da capa embutida usada pelas capas).
 Importar este módulo falha (ImportError/OSError) se a libVLC não estiver instalada;
 o composition root trata isso e segue sem o VLC.
 """
+import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Callable
 
@@ -136,27 +139,48 @@ class VlcVoice:
 
 
 class VlcMediaProbe:
-    """Lê a duração pelo cabeçalho do arquivo (leva poucos ms por arquivo)."""
+    """
+    Lê duração e capa embutida pelo cabeçalho do arquivo (poucos ms por arquivo).
+    Pode ser usada por mais de uma thread (catálogo e capas).
+    """
 
     def __init__(self, timeout_ms: int = 2000):
         self._timeout_ms = timeout_ms
         self._instance: vlc.Instance | None = None
+        self._lock = threading.Lock()
 
     def duration_of(self, path: Path) -> float | None:
-        if self._instance is None:
-            self._instance = vlc.Instance(*_BASE_ARGS, "--aout=dummy")
-        media = self._instance.media_new(str(path))
+        duration_ms = self._parse(path, vlc.MediaParseFlag.local, lambda media: media.get_duration())
+        return duration_ms / 1000.0 if duration_ms and duration_ms > 0 else None
+
+    def artwork_of(self, path: Path) -> Path | None:
+        """Imagem embutida (ex.: capa no ID3 de um MP3), que o libVLC extrai para o cache dele."""
+        url = self._parse(
+            path, vlc.MediaParseFlag(vlc.MediaParseFlag.local.value | vlc.MediaParseFlag.fetch_local.value),
+            lambda media: media.get_meta(vlc.Meta.ArtworkURL),
+        )
+        if not url or not url.startswith("file://"):
+            return None
+        artwork = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path))
+        return artwork if artwork.is_file() else None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._instance is not None:
+                self._instance.release()
+                self._instance = None
+
+    def _parse(self, path: Path, flags, read):
+        with self._lock:
+            if self._instance is None:
+                self._instance = vlc.Instance(*_BASE_ARGS, "--aout=dummy")
+            instance = self._instance
+        media = instance.media_new(str(path))
         try:
-            media.parse_with_options(vlc.MediaParseFlag.local, self._timeout_ms)
+            media.parse_with_options(flags, self._timeout_ms)
             deadline = time.monotonic() + self._timeout_ms / 1000
             while media.get_parsed_status() not in _FINISHED_PARSE and time.monotonic() < deadline:
                 time.sleep(0.002)
-            duration_ms = media.get_duration()
+            return read(media)
         finally:
             media.release()
-        return duration_ms / 1000.0 if duration_ms > 0 else None
-
-    def close(self) -> None:
-        if self._instance is not None:
-            self._instance.release()
-            self._instance = None

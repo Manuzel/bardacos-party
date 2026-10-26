@@ -10,11 +10,12 @@ if str(ROOT_DIR) not in sys.path:
 from application.audio.orchestrator import AudioOrchestrator
 from application.audio.selector import BackendSelector
 from application.library import LibraryService
+from infrastructure.covers import CoverStore
 from infrastructure.persistence.legacy_json import migrate_legacy_library
 from infrastructure.persistence.sqlite import SqliteLibraryRepository
 from infrastructure.sound_folder import LocalSoundFolder
 from providers.youtube import YouTubeProvider
-from ui.main_window import MainWindow
+from presentation.main_window import MainWindow
 
 log = logging.getLogger("bardacos")
 
@@ -60,12 +61,16 @@ def main():
     # 3. Provedor de mídia: o YouTube cumpre os dois ports (resolver e downloader)
     youtube_provider = YouTubeProvider()
 
-    # 4. Interface Gráfica
+    # 4. Capas: miniatura do YouTube ou capa embutida no arquivo, em segundo plano
+    covers = CoverStore(assets_dir / "covers", artwork_of=probe.artwork_of if probe else None)
+
+    # 5. Interface Gráfica
     app = MainWindow(
         orchestrator=orchestrator,
         library=library,
         stream_resolver=youtube_provider,
         downloader=youtube_provider,
+        covers=covers,
         sounds_dir=str(sound_folder.root)
     )
 
@@ -73,13 +78,14 @@ def main():
     def on_closing():
         app.cleanup_resources()
         app.destroy()
+        covers.close()
         repository.close()
         if probe is not None:
             probe.close()
 
     app.protocol("WM_DELETE_WINDOW", on_closing)
 
-    # 5. Inicia o loop de eventos
+    # 6. Inicia o loop de eventos
     app.mainloop()
 
 
