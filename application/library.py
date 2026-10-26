@@ -9,7 +9,7 @@ from pathlib import Path, PurePosixPath
 from domain.models import (
     SourceKind, Track, TrackId, infer_kind, new_track_id, normalize_title, title_from_filename
 )
-from domain.ports import LibraryRepository, SoundFolder
+from domain.ports import LibraryRepository, MediaProbe, SoundFolder
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,12 +17,19 @@ class SyncReport:
     added: int
     went_missing: int
     restored: int
+    probed: int = 0  # Faixas antigas que ganharam duração nesta passada
 
 
 class LibraryService:
-    def __init__(self, repository: LibraryRepository, sound_folder: SoundFolder):
+    def __init__(
+        self,
+        repository: LibraryRepository,
+        sound_folder: SoundFolder,
+        probe: MediaProbe | None = None
+    ):
         self._repository = repository
         self._sound_folder = sound_folder
+        self._probe = probe
         self._tracks: dict[TrackId, Track] = {t.id: t for t in repository.load().tracks}
 
     def tracks(self, include_missing: bool = False) -> list[Track]:
@@ -72,26 +79,47 @@ class LibraryService:
         Reconcilia a pasta de áudios com o catálogo:
         - arquivo novo vira faixa nova;
         - faixa cujo arquivo sumiu é marcada como `missing` (nunca apagada: mantém tags e cenas);
-        - faixa `missing` cujo arquivo voltou é restaurada.
+        - faixa `missing` cujo arquivo voltou é restaurada;
+        - faixa presente sem duração é sondada; a duração define o tipo inicial (efeito ou música).
         """
         on_disk = set(self._sound_folder.list_audio_files())
         known = {t.local_path: t for t in self._tracks.values() if t.source_kind == SourceKind.LOCAL}
 
-        added = [
-            Track(
+        added = []
+        for path in sorted(on_disk - known.keys()):
+            duration = self._probe_duration(path)
+            added.append(Track(
                 id=new_track_id(),
                 title=title_from_filename(PurePosixPath(path).stem),
-                kind=infer_kind(None),
+                kind=infer_kind(duration),
                 source_kind=SourceKind.LOCAL,
                 local_path=path,
-            )
-            for path in sorted(on_disk - known.keys())
-        ]
-        went_missing = [replace(t, missing=True) for p, t in known.items() if p not in on_disk and not t.missing]
-        restored = [replace(t, missing=False) for p, t in known.items() if p in on_disk and t.missing]
+                duration_s=duration,
+            ))
 
-        self._save(*added, *went_missing, *restored)
-        return SyncReport(added=len(added), went_missing=len(went_missing), restored=len(restored))
+        changed: list[Track] = []
+        went_missing = restored = probed = 0
+        for path, track in known.items():
+            present = path in on_disk
+            updated = replace(track, missing=not present)
+            if present and track.duration_s is None and (duration := self._probe_duration(path)) is not None:
+                updated = replace(updated, duration_s=duration, kind=infer_kind(duration))
+                probed += 1
+            if updated == track:
+                continue
+            changed.append(updated)
+            if updated.missing:
+                went_missing += 1
+            elif track.missing:
+                restored += 1
+
+        self._save(*added, *changed)
+        return SyncReport(added=len(added), went_missing=went_missing, restored=restored, probed=probed)
+
+    def _probe_duration(self, relative_path: str) -> float | None:
+        if self._probe is None:
+            return None
+        return self._probe.duration_of(self._sound_folder.absolute_path(relative_path))
 
     def _save(self, *tracks: Track) -> None:
         if not tracks:

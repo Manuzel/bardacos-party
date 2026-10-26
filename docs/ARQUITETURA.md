@@ -1,6 +1,6 @@
 # Bardaco's Party — Documento de Design Arquitetural (HLD)
 
-> Status: **proposta, aguardando aprovação** · Base avaliada: commit `6ccb7b6` · Python 3.14 (GIL padrão)
+> Status: **aprovado** · Implementados: módulo 1 (fundação) e módulo 2 (orquestrador) · Base avaliada: commit `6ccb7b6` · Python 3.14 (GIL padrão)
 
 Escopo: (1) Tags e indexação, (2) Cenas e orquestração, (3) Fade In/Out assíncrono.
 Este documento não contém código final; os trechos são contratos e pseudocódigo.
@@ -37,8 +37,18 @@ Conclusão: antes de tags/cenas/fades, é preciso uma fundação — **um dono �
 ### 1.1 Camadas (Clean Architecture)
 
 Os pacotes ficam na raiz do repositório (sem um pacote `bardacos/` envolvendo), seguindo o
-estilo de import que o projeto já usa. `audio/` migra para `infrastructure/backends/` no
+estilo de import que o projeto já usa. O antigo `audio/` virou `infrastructure/backends/` no
 módulo 2, e `ui/` vira `presentation/` no módulo 4.
+
+Ajustes feitos no módulo 2, em relação ao plano:
+- O orquestrador se divide em `Mixer` (lógica pura, testada sem threads) e `AudioOrchestrator`
+  (só a thread e a fila em volta).
+- A resolução de streams continua disparada pela UI (pelo `UiPump`, sem `after()` vindo de
+  outras threads). Ela vai para dentro do orquestrador, com as épocas, no módulo 5 (cenas).
+- Sem vagas em nenhum backend, a voz nova é recusada com aviso; nada é cortado em silêncio.
+  O roubo de voz por prioridade fica para as cenas, que é onde a prioridade passa a existir.
+- Arquivos locais têm a duração lida pelo cabeçalho (via libVLC, poucos ms por arquivo) ao
+  entrar no catálogo; é ela que manda efeitos curtos para o Pygame.
 
 ```
 (raiz)

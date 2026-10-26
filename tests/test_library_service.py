@@ -20,6 +20,16 @@ class FakeSoundFolder:
         return Path("/sons") / relative_path
 
 
+class FakeProbe:
+    def __init__(self, durations: dict[str, float | None]):
+        self.durations = durations
+        self.calls: list[Path] = []
+
+    def duration_of(self, path: Path) -> float | None:
+        self.calls.append(path)
+        return self.durations.get(path.name)
+
+
 class FailingCommitRepository(SqliteLibraryRepository):
     """Simula uma falha de disco: a transação é aberta, mas nunca confirma."""
 
@@ -99,6 +109,48 @@ class LibraryServiceTest(unittest.TestCase):
         self.assertIsNone(self.library.get(track.id))
         self.assertEqual(LibraryService(self.repo, self.folder).tracks(), [])
         self.assertIsNone(self.library.remove_track(track.id))
+
+    def test_sonda_define_duracao_e_tipo_dos_arquivos_novos(self):
+        probe = FakeProbe({"espada.wav": 1.2, "taverna.mp3": 240.0})
+        library = LibraryService(self.repo, FakeSoundFolder("espada.wav", "taverna.mp3", "estranho.ogg"), probe)
+
+        library.refresh_local_files()
+
+        by_title = {t.title: t for t in library.tracks()}
+        self.assertEqual((by_title["Espada"].duration_s, by_title["Espada"].kind), (1.2, TrackKind.SFX))
+        self.assertEqual(by_title["Taverna"].kind, TrackKind.MUSIC)
+        self.assertIsNone(by_title["Estranho"].duration_s)
+        self.assertEqual(probe.calls[0], Path("/sons/espada.wav"))
+
+    def test_faixas_antigas_sem_duracao_sao_sondadas_uma_vez(self):
+        self.folder.files = ["grito.wav"]
+        self.library.refresh_local_files()  # Sem sonda (como no módulo 1)
+        (old,) = self.library.tracks()
+
+        probe = FakeProbe({"grito.wav": 2.0})
+        library = LibraryService(self.repo, self.folder, probe)
+        report = library.refresh_local_files()
+
+        self.assertEqual(report.probed, 1)
+        (track,) = library.tracks()
+        self.assertEqual((track.id, track.duration_s, track.kind), (old.id, 2.0, TrackKind.SFX))
+        library.refresh_local_files()
+        self.assertEqual(len(probe.calls), 1)  # Já tem duração: não sonda de novo
+
+    def test_arquivo_que_volta_e_sondado_e_restaurado_numa_gravacao_so(self):
+        self.folder.files = ["grito.wav"]
+        self.library.refresh_local_files()
+        self.folder.files = []
+        self.library.refresh_local_files()
+
+        self.folder.files = ["grito.wav"]
+        library = LibraryService(self.repo, self.folder, FakeProbe({"grito.wav": 2.0}))
+        report = library.refresh_local_files()
+
+        self.assertEqual((report.restored, report.probed), (1, 1))
+        (track,) = library.tracks()
+        self.assertFalse(track.missing)
+        self.assertEqual(track.duration_s, 2.0)
 
     def test_falha_ao_gravar_nao_altera_a_memoria(self):
         repo = FailingCommitRepository(":memory:")
