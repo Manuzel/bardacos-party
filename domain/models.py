@@ -73,6 +73,21 @@ class Tag:
 
 
 @dataclass(frozen=True, slots=True)
+class PlayableSource:
+    """O que um backend de áudio consegue abrir: um arquivo local ou uma URL direta."""
+    uri: str
+    is_remote: bool
+
+    def __post_init__(self) -> None:
+        if not self.uri:
+            raise ValueError("Fonte de áudio vazia.")
+
+    @classmethod
+    def from_uri(cls, uri: str) -> "PlayableSource":
+        return cls(uri=uri, is_remote=uri.startswith(("http://", "https://", "rtsp://", "mms://")))
+
+
+@dataclass(frozen=True, slots=True)
 class LibraryData:
     """Tudo o que o repositório guarda, carregado de uma vez na inicialização."""
     tracks: tuple[Track, ...]

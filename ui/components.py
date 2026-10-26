@@ -1,8 +1,13 @@
-from pathlib import Path
 from typing import Callable, Optional
 import customtkinter as ctk
 
-from audio.engine import AudioEngine
+from application.audio.messages import (
+    AudioCommand, Seek, SetLoop, SetVolume, Stop, TogglePlay, VoiceState, VoiceView
+)
+from domain.models import PlayableSource, SourceKind, Track
+
+# O botão está mostrando outra coisa (conectando, erro): o próximo estado sempre redesenha.
+_DIRTY = object()
 
 
 def format_time(seconds: float) -> str:
@@ -23,19 +28,18 @@ class SoundCard(ctk.CTkFrame):
     - Resolução On-Demand (Lazy Loading) de URLs de streaming expiradas
     - Controle de volume independente
     - Botão de download rápido (💾) para salvar áudios na biblioteca permanente
-    - Botão de remoção (🗑️) com exclusão física ou descarte do JSON
+    - Botão de remoção (🗑️) com exclusão física ou descarte do registro
+
+    O card não fala com os players: envia comandos (`send`) e desenha o estado que
+    chega do orquestrador em `apply_view`.
     """
 
     def __init__(
         self,
         master,
-        sound_id: str,
-        title: str,
+        track: Track,
         source: str,
-        audio_engine: AudioEngine,
-        mode_type: str = "local",  # 'stream', 'cache', 'local'
-        duration: float = 0.0,
-        original_url: Optional[str] = None,
+        send: Callable[[AudioCommand], None],
         on_save_to_library: Optional[Callable[[str, str], None]] = None,
         on_delete: Optional[Callable[[str], None]] = None,
         on_resolve_source: Optional[Callable[[str, str, str, Callable[[str], None], Callable[[Exception], None]], None]] = None,
@@ -43,24 +47,27 @@ class SoundCard(ctk.CTkFrame):
     ):
         super().__init__(master, corner_radius=12, fg_color="#1a1d26", border_width=1, border_color="#2b3040", **kwargs)
 
-        self.sound_id = sound_id
-        self.title = title
+        self.track = track
+        self.sound_id = track.id
+        self.title = track.title
         self.source = source
-        self.audio_engine = audio_engine
-        self.mode_type = mode_type
-        self.duration = duration
-        self.original_url = original_url
+        self.send = send
+        self.mode_type = track.source_kind.value  # 'stream', 'cache', 'local'
+        self.duration = track.duration_s or 0.0
+        self.original_url = track.origin_url
         self.on_save_to_library = on_save_to_library
         self.on_delete = on_delete
         self.on_resolve_source = on_resolve_source
 
-        self.current_volume: float = 0.8
-        self.is_looping: bool = False
+        self.current_volume: float = track.default_volume
+        self.is_looping: bool = track.default_loop
         self._is_user_seeking: bool = False
         self._is_resolving: bool = False
+        self._showing_error: bool = False
+        self._view: VoiceView | None = None
+        self._rendered_state: object = None  # VoiceState, None (parado) ou _DIRTY
 
         self._build_ui()
-        self._sync_playback_ui()
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -168,6 +175,8 @@ class SoundCard(ctk.CTkFrame):
             progress_color="#10b981",
             command=self._on_toggle_loop
         )
+        if self.is_looping:
+            self.loop_switch.select()
         self.loop_switch.grid(row=0, column=2, padx=(4, 0), sticky="e")
 
         # ---------------- 4. VOLUME, DOWNLOAD E BOTÃO DE LIXEIRA ----------------
@@ -192,7 +201,7 @@ class SoundCard(ctk.CTkFrame):
 
         self.vol_label = ctk.CTkLabel(
             bottom_frame,
-            text="80%",
+            text=f"{int(self.current_volume * 100)}%",
             font=ctk.CTkFont(size=10),
             text_color="#9ca3af",
             width=28
@@ -233,63 +242,52 @@ class SoundCard(ctk.CTkFrame):
         if self._is_resolving:
             return
 
-        if self.audio_engine.is_playing(self.sound_id):
-            self.audio_engine.pause(self.sound_id)
-            self._set_paused_ui()
-        elif self.audio_engine.is_paused(self.sound_id):
-            self.audio_engine.resume(self.sound_id)
-            self._set_playing_ui()
-        else:
-            # Caso a fonte ainda não tenha sido resolvida (ex: sessão reiniciada)
-            if not self.source and self.on_resolve_source:
-                self._resolve_and_play()
-                return
+        # Caso a fonte ainda não tenha sido resolvida (ex: sessão reiniciada)
+        if self._view is None and not self.source and self.on_resolve_source:
+            self._resolve_and_play()
+            return
 
-            self._execute_play()
+        self._send_toggle()
 
-    def _execute_play(self) -> None:
-        success = self.audio_engine.play(
-            sound_id=self.sound_id,
-            source=self.source,
+    def _send_toggle(self) -> None:
+        # Tocar, pausar ou retomar: o orquestrador decide pelo estado verdadeiro da voz.
+        self.send(TogglePlay(
+            voice_id=self.sound_id,
+            track=self.track,
+            source=PlayableSource.from_uri(self.source),
             volume=self.current_volume,
-            loop=self.is_looping,
-            duration=self.duration
-        )
-        if success:
-            self._set_playing_ui()
+            loop=self.is_looping
+        ))
 
     def _resolve_and_play(self) -> None:
         """Resolve o link do streaming ou baixa para o cache antes de tocar."""
         self._is_resolving = True
+        self._rendered_state = _DIRTY
         self.play_btn.configure(text="⏳ Conectando...", fg_color="#d97706")
 
         def on_resolved(resolved_source: str):
             self._is_resolving = False
             self.source = resolved_source
-            self._execute_play()
+            self._send_toggle()
 
         def on_failed(exc: Exception):
             self._is_resolving = False
-            self.play_btn.configure(text="Erro de Rede", fg_color="#dc2626")
-            self.after(2500, self._set_stopped_ui)
+            self.show_error("Erro de Rede")
 
         target_url = self.original_url or self.source
         self.on_resolve_source(self.sound_id, target_url, self.mode_type, on_resolved, on_failed)
 
     def stop(self) -> None:
-        """Interrompe a faixa e zera o marcador temporal."""
-        self.audio_engine.stop(self.sound_id)
-        self.timeline_slider.set(0.0)
-        self.time_label.configure(text=f"00:00 / {format_time(self.duration)}")
-        self._set_stopped_ui()
+        """Interrompe a faixa; o card volta ao estado parado quando o snapshot confirmar."""
+        self.send(Stop(self.sound_id))
 
     def _on_toggle_loop(self) -> None:
         self.is_looping = bool(self.loop_switch.get())
-        self.audio_engine.set_loop(self.sound_id, self.is_looping)
+        self.send(SetLoop(self.sound_id, self.is_looping))
 
     def _on_volume_change(self, value: float) -> None:
         self.current_volume = float(value)
-        self.audio_engine.set_volume(self.sound_id, self.current_volume)
+        self.send(SetVolume(self.sound_id, self.current_volume))
         self.vol_label.configure(text=f"{int(self.current_volume * 100)}%")
 
     # --- LÓGICA DA LINHA DO TEMPO (SEEKBAR) ---
@@ -304,7 +302,7 @@ class SoundCard(ctk.CTkFrame):
 
     def _on_seek_release(self, event) -> None:
         target_seconds = float(self.timeline_slider.get())
-        self.audio_engine.seek(self.sound_id, target_seconds)
+        self.send(Seek(self.sound_id, target_seconds))
         self._is_user_seeking = False
 
     def _on_save_button_clicked(self) -> None:
@@ -320,7 +318,57 @@ class SoundCard(ctk.CTkFrame):
         if self.on_delete:
             self.on_delete(self.sound_id)
 
-    # --- SINCRONIZAÇÃO E ESTADOS VISUAIS ---
+    # --- SINCRONIZAÇÃO COM O ORQUESTRADOR ---
+
+    def apply_view(self, view: Optional[VoiceView]) -> None:
+        """Desenha o estado da voz vindo do snapshot (None = parada)."""
+        self._view = view
+
+        if view is None:
+            if self._rendered_state is not None:
+                self.timeline_slider.set(0.0)
+                self.time_label.configure(text=f"00:00 / {format_time(self.duration)}")
+            self._render_state(None)
+            return
+
+        if view.duration_s and abs(view.duration_s - self.duration) > 0.5:
+            self.duration = view.duration_s
+            self.timeline_slider.configure(to=max(1.0, self.duration))
+
+        self._render_state(view.state)
+        if not self._is_user_seeking:
+            self.timeline_slider.set(view.position_s)
+            self.time_label.configure(text=f"{format_time(view.position_s)} / {format_time(self.duration)}")
+
+    def show_error(self, text: str = "⚠ Erro") -> None:
+        """Mostra a falha no botão por alguns segundos. Um stream que falhou é resolvido de novo no próximo play."""
+        if self.mode_type == SourceKind.STREAM.value:
+            self.source = ""
+        self._showing_error = True
+        self._rendered_state = _DIRTY
+        self.play_btn.configure(text=text, fg_color="#dc2626", hover_color="#b91c1c")
+
+        def clear() -> None:
+            self._showing_error = False
+            self.apply_view(self._view)
+
+        self.after(2500, clear)
+
+    def _render_state(self, state: Optional[VoiceState]) -> None:
+        # Só reconfigura os widgets quando o estado muda: o snapshot chega 10x por segundo.
+        if self._showing_error or self._is_resolving or state is self._rendered_state:
+            return
+        self._rendered_state = state
+
+        if state == VoiceState.PLAYING:
+            self._set_playing_ui()
+        elif state == VoiceState.PAUSED:
+            self._set_paused_ui()
+        else:
+            self._set_stopped_ui()
+
+        seek_state = "normal" if self._view is None or self._view.supports_seek else "disabled"
+        self.timeline_slider.configure(state=seek_state)
 
     def _set_playing_ui(self) -> None:
         self.play_btn.configure(text="⏸ Pausar", fg_color="#059669", hover_color="#047857")
@@ -333,22 +381,3 @@ class SoundCard(ctk.CTkFrame):
     def _set_stopped_ui(self) -> None:
         self.play_btn.configure(text="▶ Tocar", fg_color="#2563eb", hover_color="#1d4ed8")
         self.configure(border_color="#2b3040", border_width=1)
-
-    def _sync_playback_ui(self) -> None:
-        if self.audio_engine.is_playing(self.sound_id):
-            if not self._is_user_seeking:
-                pos = self.audio_engine.get_position(self.sound_id)
-                dur = self.audio_engine.get_duration(self.sound_id)
-
-                if dur > 0 and self.duration <= 0:
-                    self.duration = dur
-                    self.timeline_slider.configure(to=dur)
-
-                self.timeline_slider.set(pos)
-                self.time_label.configure(text=f"{format_time(pos)} / {format_time(self.duration)}")
-        else:
-            if not self.audio_engine.is_paused(self.sound_id) and not self._is_resolving:
-                if self.play_btn.cget("text") not in ("▶ Tocar", "Erro de Rede"):
-                    self._set_stopped_ui()
-
-        self.after(300, self._sync_playback_ui)

@@ -5,10 +5,11 @@ injetadas pelo composition root (`main.py`). Tipagem estrutural (Protocol):
 um adapter não precisa herdar daqui, só cumprir a assinatura.
 """
 from contextlib import AbstractContextManager
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from domain.models import LibraryData, Tag, TagId, Track, TrackId
+from domain.models import BackendHint, LibraryData, PlayableSource, Tag, TagId, Track, TrackId
 
 
 # ---------------- Persistência ----------------
@@ -47,6 +48,70 @@ class SoundFolder(Protocol):
         ...
 
     def absolute_path(self, relative_path: str) -> Path: ...
+
+
+class MediaProbe(Protocol):
+    def duration_of(self, path: Path) -> float | None:
+        """Duração em segundos lendo só o cabeçalho; None se não der para saber."""
+        ...
+
+
+# ---------------- Reprodução ----------------
+# Só a thread do orquestrador chama VoiceHandle e PlaybackBackend.
+
+class BackendEvent(StrEnum):
+    PLAYING = "playing"  # A saída de áudio abriu (reaplicar o volume)
+    ENDED = "ended"      # Chegou ao fim sem emendar sozinho
+    ERROR = "error"      # Não foi possível tocar (arquivo sumido, URL expirada...)
+
+
+class VoiceLimitReached(Exception):
+    """O backend não tem mais vozes/canais livres."""
+
+
+class VoiceHandle(Protocol):
+    supports_seek: bool
+
+    def start(self) -> None: ...
+    def pause(self) -> None: ...
+    def resume(self) -> None: ...
+    def restart(self) -> None:
+        """Volta ao início e toca de novo (loop sem emenda nativa)."""
+        ...
+    def stop(self) -> None:
+        """Para e libera os recursos; o handle não pode ser reusado."""
+        ...
+    def seek(self, seconds: float) -> None: ...
+    def set_loop(self, loop: bool) -> None:
+        """Backends que emendam sozinhos usam isto; os outros emitem ENDED e recebem restart()."""
+        ...
+    def apply_gain(self, gain: float, force: bool = False) -> None:
+        """Ganho linear 0–1. O adapter quantiza e só chama a biblioteca se o valor mudou."""
+        ...
+    def position(self) -> float: ...
+    def duration(self) -> float | None: ...
+    def poll(self) -> None:
+        """Chamado a cada tick; backends sem callback nativo detectam o fim aqui."""
+        ...
+
+
+class PlaybackBackend(Protocol):
+    name: BackendHint
+
+    def open(self) -> None:
+        """Inicializa a biblioteca. Chamado pela thread do orquestrador."""
+        ...
+
+    def close(self) -> None: ...
+
+    def create_voice(
+        self,
+        source: PlayableSource,
+        loop: bool,
+        on_event: Callable[[BackendEvent], None]
+    ) -> VoiceHandle:
+        """Prepara uma voz parada. `on_event` pode ser chamado de qualquer thread. Sem vaga -> VoiceLimitReached."""
+        ...
 
 
 # ---------------- Provedores de mídia ----------------

@@ -1,27 +1,30 @@
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import customtkinter as ctk
 
+from application.audio.messages import AudioEvent, MixerSnapshot, Stop, StopAll, VoiceFailed, VoiceView
+from application.audio.orchestrator import AudioOrchestrator
 from application.library import LibraryService
-from audio.engine import AudioEngine
-from domain.models import SourceKind
+from domain.models import SourceKind, Track
 from domain.ports import StreamResolver, TrackDownloader
 from ui.components import SoundCard
+from ui.pump import UiPump
 
 
 class MainWindow(ctk.CTk):
     """
     Janela Principal do Bardaco's Party com:
     - Catálogo único (LibraryService) para faixas locais, de streaming e de cache
+    - Áudio pelo orquestrador: a janela envia comandos e desenha os snapshots
     - Resolução On-Demand de streams salvos
     - Exclusão dinâmica com remoção física de arquivo ou descarte de registro
     """
 
     def __init__(
         self,
-        audio_engine: AudioEngine,
+        orchestrator: AudioOrchestrator,
         library: LibraryService,
         stream_resolver: StreamResolver,
         downloader: TrackDownloader,
@@ -29,7 +32,7 @@ class MainWindow(ctk.CTk):
     ):
         super().__init__()
 
-        self.audio_engine = audio_engine
+        self.orchestrator = orchestrator
         self.library = library
         self.stream_resolver = stream_resolver
         self.downloader = downloader
@@ -48,9 +51,20 @@ class MainWindow(ctk.CTk):
         self.configure(fg_color="#0b0d12")
 
         self.cards_dict: Dict[str, SoundCard] = {}
+        self._snapshot = MixerSnapshot.empty()
+        self._drawn_views: Dict[str, Optional[VoiceView]] = {}
+
+        # Único laço de atualização da UI (substitui os timers de cada card)
+        self._pump = UiPump(
+            self,
+            orchestrator,
+            on_snapshot=self._on_mixer_snapshot,
+            on_event=self._on_audio_event
+        )
 
         self._build_ui()
         self.load_sound_cards()
+        self._pump.start()
 
     def _build_ui(self) -> None:
         self.grid_rowconfigure(2, weight=1)
@@ -202,8 +216,8 @@ class MainWindow(ctk.CTk):
             self._show_status("Extraindo fluxo direto de áudio (Nuvem)...", is_error=False)
             self.stream_resolver.get_stream_url(
                 query_or_url=query,
-                on_success=lambda url, meta: self.after(0, self._on_stream_ready, url, meta, query),
-                on_error=lambda exc: self.after(0, self._on_operation_error, exc)
+                on_success=lambda url, meta: self._pump.post(self._on_stream_ready, url, meta, query),
+                on_error=lambda exc: self._pump.post(self._on_operation_error, exc)
             )
 
         elif mode == "Tocar em Cache":
@@ -211,9 +225,9 @@ class MainWindow(ctk.CTk):
             self.downloader.download(
                 query_or_url=query,
                 output_dir=self.temp_cache_dir.name,
-                on_progress=lambda pct, msg: self.after(0, self._on_progress, pct, msg),
-                on_complete=lambda path, meta: self.after(0, self._on_cache_ready, path, meta, query),
-                on_error=lambda exc: self.after(0, self._on_operation_error, exc)
+                on_progress=lambda pct, msg: self._pump.post(self._on_progress, pct, msg),
+                on_complete=lambda path, meta: self._pump.post(self._on_cache_ready, path, meta, query),
+                on_error=lambda exc: self._pump.post(self._on_operation_error, exc)
             )
 
         elif mode == "Salvar na Biblioteca":
@@ -221,9 +235,9 @@ class MainWindow(ctk.CTk):
             self.downloader.download(
                 query_or_url=query,
                 output_dir=str(self.sounds_dir),
-                on_progress=lambda pct, msg: self.after(0, self._on_progress, pct, msg),
-                on_complete=lambda path, meta: self.after(0, self._on_library_download_ready, path, meta),
-                on_error=lambda exc: self.after(0, self._on_operation_error, exc)
+                on_progress=lambda pct, msg: self._pump.post(self._on_progress, pct, msg),
+                on_complete=lambda path, meta: self._pump.post(self._on_library_download_ready, path, meta),
+                on_error=lambda exc: self._pump.post(self._on_operation_error, exc)
             )
 
     def _on_progress(self, percent: float, msg: str) -> None:
@@ -235,60 +249,32 @@ class MainWindow(ctk.CTk):
         title = meta.get("title", "Streaming YouTube")
         duration = float(meta.get("duration", 0.0))
         target_url = meta.get("webpage_url") or original_query
-        sound_id = self.library.add_remote_track(
+        track = self.library.add_remote_track(
             title=title,
             origin_url=target_url,
             source_kind=SourceKind.STREAM,
             duration_s=duration
-        ).id
+        )
 
         self._show_status(f"Streaming registrado: '{title}'", is_error=False)
         self._finish_action()
-
-        card = SoundCard(
-            master=self.scroll_frame,
-            sound_id=sound_id,
-            title=title,
-            source=stream_url,
-            audio_engine=self.audio_engine,
-            mode_type="stream",
-            duration=duration,
-            original_url=target_url,
-            on_save_to_library=self._save_card_to_permanent_library,
-            on_delete=self._delete_sound_card,
-            on_resolve_source=self._resolve_virtual_track
-        )
-        self._add_card_to_grid(sound_id, card, auto_play=True)
+        self._add_card_to_grid(self._make_card(track, source=stream_url), auto_play=True)
 
     def _on_cache_ready(self, file_path: str, meta: dict, original_query: str) -> None:
         """Registra a faixa de cache no catálogo e adiciona ao Grid."""
         title = meta.get("title", Path(file_path).stem)
         duration = float(meta.get("duration", 0.0))
         target_url = meta.get("webpage_url") or original_query
-        sound_id = self.library.add_remote_track(
+        track = self.library.add_remote_track(
             title=title,
             origin_url=target_url,
             source_kind=SourceKind.CACHE,
             duration_s=duration
-        ).id
+        )
 
         self._show_status(f"Faixa em cache registrada: '{title}'", is_error=False)
         self._finish_action()
-
-        card = SoundCard(
-            master=self.scroll_frame,
-            sound_id=sound_id,
-            title=title,
-            source=file_path,
-            audio_engine=self.audio_engine,
-            mode_type="cache",
-            duration=duration,
-            original_url=target_url,
-            on_save_to_library=self._save_card_to_permanent_library,
-            on_delete=self._delete_sound_card,
-            on_resolve_source=self._resolve_virtual_track
-        )
-        self._add_card_to_grid(sound_id, card, auto_play=True)
+        self._add_card_to_grid(self._make_card(track, source=file_path), auto_play=True)
 
     def _on_library_download_ready(self, file_path: str, meta: dict) -> None:
         title = meta.get("title", Path(file_path).stem)
@@ -301,8 +287,8 @@ class MainWindow(ctk.CTk):
         self.downloader.download(
             query_or_url=original_url,
             output_dir=str(self.sounds_dir),
-            on_complete=lambda path, meta: self.after(0, self._on_background_save_complete, meta),
-            on_error=lambda exc: self.after(0, self._on_operation_error, exc)
+            on_complete=lambda path, meta: self._pump.post(self._on_background_save_complete, meta),
+            on_error=lambda exc: self._pump.post(self._on_operation_error, exc)
         )
 
     def _on_background_save_complete(self, meta: dict) -> None:
@@ -341,15 +327,15 @@ class MainWindow(ctk.CTk):
         if mode_type == "stream":
             self.stream_resolver.get_stream_url(
                 query_or_url=target_url,
-                on_success=lambda url, meta: self.after(0, on_ready, url),
-                on_error=lambda exc: self.after(0, on_error, exc)
+                on_success=lambda url, meta: self._pump.post(on_ready, url),
+                on_error=lambda exc: self._pump.post(on_error, exc)
             )
         elif mode_type == "cache":
             self.downloader.download(
                 query_or_url=target_url,
                 output_dir=self.temp_cache_dir.name,
-                on_complete=lambda path, meta: self.after(0, on_ready, path),
-                on_error=lambda exc: self.after(0, on_error, exc)
+                on_complete=lambda path, meta: self._pump.post(on_ready, path),
+                on_error=lambda exc: self._pump.post(on_error, exc)
             )
 
     # --- MESCLAGEM (MERGE) E EXCLUSÃO DA BIBLIOTECA ---
@@ -363,37 +349,39 @@ class MainWindow(ctk.CTk):
             card.destroy()
         self.cards_dict.clear()
 
+        self._drawn_views.clear()
+
         self.library.refresh_local_files()
 
         for track in self.library.tracks():
             if track.source_kind == SourceKind.LOCAL:
-                card = SoundCard(
-                    master=self.scroll_frame,
-                    sound_id=track.id,
-                    title=track.title,
-                    source=str(self.library.local_file_of(track)),
-                    audio_engine=self.audio_engine,
-                    mode_type=track.source_kind.value,
-                    duration=track.duration_s or 0.0,
-                    on_delete=self._delete_sound_card
-                )
+                source = str(self.library.local_file_of(track))
             else:
-                card = SoundCard(
-                    master=self.scroll_frame,
-                    sound_id=track.id,
-                    title=track.title,
-                    source="",  # Será resolvido On-Demand no primeiro Play
-                    audio_engine=self.audio_engine,
-                    mode_type=track.source_kind.value,
-                    duration=track.duration_s or 0.0,
-                    original_url=track.origin_url,
-                    on_save_to_library=self._save_card_to_permanent_library,
-                    on_delete=self._delete_sound_card,
-                    on_resolve_source=self._resolve_virtual_track
-                )
-            self.cards_dict[track.id] = card
+                source = ""  # Será resolvido On-Demand no primeiro Play
+            self.cards_dict[track.id] = self._make_card(track, source)
 
         self._reposition_cards()
+        # Faixas que já tocavam continuam tocando; os cards novos mostram isso na hora.
+        self._draw_snapshot()
+
+    def _make_card(self, track: Track, source: str) -> SoundCard:
+        if track.source_kind == SourceKind.LOCAL:
+            return SoundCard(
+                master=self.scroll_frame,
+                track=track,
+                source=source,
+                send=self.orchestrator.send,
+                on_delete=self._delete_sound_card
+            )
+        return SoundCard(
+            master=self.scroll_frame,
+            track=track,
+            source=source,
+            send=self.orchestrator.send,
+            on_save_to_library=self._save_card_to_permanent_library,
+            on_delete=self._delete_sound_card,
+            on_resolve_source=self._resolve_virtual_track
+        )
 
     def _delete_sound_card(self, sound_id: str) -> None:
         """
@@ -407,7 +395,7 @@ class MainWindow(ctk.CTk):
             return
 
         # Para a reprodução imediatamente
-        self.audio_engine.stop(sound_id)
+        self.orchestrator.send(Stop(sound_id))
 
         # 1. Exclusão física para arquivos locais
         if card.mode_type == "local":
@@ -431,12 +419,13 @@ class MainWindow(ctk.CTk):
         # 3. Remoção do componente da interface
         card.destroy()
         del self.cards_dict[sound_id]
+        self._drawn_views.pop(sound_id, None)
         self._reposition_cards()
 
         self._show_status(f"Faixa '{card.title}' removida com sucesso.", is_error=False)
 
-    def _add_card_to_grid(self, sound_id: str, card: SoundCard, auto_play: bool = False) -> None:
-        self.cards_dict[sound_id] = card
+    def _add_card_to_grid(self, card: SoundCard, auto_play: bool = False) -> None:
+        self.cards_dict[card.sound_id] = card
         self._reposition_cards()
         if auto_play:
             card._toggle_playback()
@@ -449,14 +438,34 @@ class MainWindow(ctk.CTk):
             card.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
 
     def _on_stop_all(self) -> None:
-        self.audio_engine.stop_all()
-        for card in self.cards_dict.values():
-            card.stop()
+        self.orchestrator.send(StopAll())
+
+    # --- RETORNO DO ORQUESTRADOR (chamado pelo UiPump, na thread da UI) ---
+
+    def _on_mixer_snapshot(self, snapshot: MixerSnapshot) -> None:
+        self._snapshot = snapshot
+        self._draw_snapshot()
+
+    def _draw_snapshot(self) -> None:
+        """Atualiza só os cards cuja voz mudou desde o último desenho."""
+        for sound_id, card in self.cards_dict.items():
+            view = self._snapshot.voices.get(sound_id)
+            if sound_id not in self._drawn_views or self._drawn_views[sound_id] != view:
+                self._drawn_views[sound_id] = view
+                card.apply_view(view)
+
+    def _on_audio_event(self, event: AudioEvent) -> None:
+        if isinstance(event, VoiceFailed):
+            card = self.cards_dict.get(event.voice_id)
+            if card:
+                card.show_error()
+            self._show_status(event.reason, is_error=True)
 
     def cleanup_resources(self) -> None:
-        """Limpa recursos e descarta os arquivos da pasta temporária."""
+        """Para o áudio e descarta os arquivos da pasta temporária."""
         try:
-            self.audio_engine.stop_all()
+            self._pump.stop()
+            self.orchestrator.shutdown()
             self.temp_cache_dir.cleanup()
         except Exception as e:
             print(f"[Cleanup Error] {e}")
